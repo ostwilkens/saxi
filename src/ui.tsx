@@ -6,7 +6,7 @@ import * as colormap from "colormap"
 
 import {flattenSVG} from "flatten-svg";
 import {PaperSize} from "./paper-size";
-import {Device, Plan, PlanOptions, defaultPlanOptions, XYMotion, PenMotion} from "./planning";
+import {Device, Plan, PlanOptions, defaultPlanOptions, XYMotion} from "./planning";
 import {formatDuration} from "./util";
 import {Vec2} from "./vec";
 
@@ -17,7 +17,6 @@ import "./style.css";
 import pathJoinRadiusIcon from "./icons/path-joining radius.svg";
 import pointJoinRadiusIcon from "./icons/point-joining radius.svg";
 import rotateDrawingIcon from "./icons/rotate-drawing.svg";
-import { EBB } from "./ebb";
 
 const defaultVisualizationOptions = {
   penStrokeWidth: 0.5,
@@ -83,133 +82,9 @@ interface DeviceInfo {
   path: string;
 }
 
-interface Driver {
-  onprogress: (motionIdx: number) => void | null;
-  oncancelled: () => void | null;
-  onfinished: () => void | null;
-  ondevinfo: (devInfo: DeviceInfo) => void | null;
-  onpause: (paused: boolean) => void | null;
-  onconnectionchange: (connected: boolean) => void | null;
-  onplan: (plan: Plan) => void | null;
-
-  plot(plan: Plan): void;
-
-  cancel(): void;
-  pause(): void;
-  resume(): void;
-  setPenHeight(height: number, rate: number): void;
-  limp(): void;
-
-  name(): string;
-  close(): Promise<void>;
-}
-
-class WebSerialDriver implements Driver {
-  public onprogress: (motionIdx: number) => void;
-  public oncancelled: () => void;
-  public onfinished: () => void;
-  public ondevinfo: (devInfo: DeviceInfo) => void;
-  public onpause: (paused: boolean) => void;
-  public onconnectionchange: (connected: boolean) => void;
-  public onplan: (plan: Plan) => void;
-
-  private _unpaused: Promise<void> = null;
-  private _signalUnpause: () => void = null;
-  private _cancelRequested: boolean = false;
-
-  public static async connect(port?: SerialPort) {
-    if (!port)
-      port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x04D8, usbProductId: 0xFD92 }] })
-    // baudRate ref: https://github.com/evil-mad/plotink/blob/a45739b7d41b74d35c1e933c18949ed44c72de0e/plotink/ebb_serial.py#L281
-    // (doesn't specify baud rate)
-    // and https://pyserial.readthedocs.io/en/latest/pyserial_api.html#serial.Serial.__init__
-    // (pyserial defaults to 9600)
-    await port.open({ baudRate: 9600 })
-    const { usbVendorId, usbProductId } = port.getInfo()
-    return new WebSerialDriver(new EBB(port), `${usbVendorId.toString(16).padStart(4, '0')}:${usbProductId.toString(16).padStart(4, '0')}`)
-  }
-
-  private _name: string
-  public name(): string {
-    return this._name
-  }
-
-  private ebb: EBB
-  private constructor(ebb: EBB, name: string) {
-    this.ebb = ebb
-    this._name = name
-  }
-
-  public close(): Promise<void> {
-    return this.ebb.close()
-  }
-
-  public async plot(plan: Plan): Promise<void> {
-    const microsteppingMode = 2
-    this._unpaused = null;
-    this._cancelRequested = false;
-    await this.ebb.enableMotors(microsteppingMode);
-
-    let motionIdx = 0
-    let penIsUp = true;
-    for (const motion of plan.motions) {
-      if (this.onprogress) this.onprogress(motionIdx)
-      await this.ebb.executeMotion(motion);
-      if (motion instanceof PenMotion) {
-        penIsUp = motion.initialPos < motion.finalPos;
-      }
-      if (this._unpaused && penIsUp) {
-        await this._unpaused
-        if (this.onpause) this.onpause(false)
-      }
-      if (this._cancelRequested) { break; }
-      motionIdx += 1
-    }
-
-    if (this._cancelRequested) {
-      await this.ebb.setPenHeight(Device.Axidraw.penPctToPos(0), 1000);
-      if (this.oncancelled) this.oncancelled()
-    } else {
-      if (this.onfinished) this.onfinished()
-    }
-
-    await this.ebb.waitUntilMotorsIdle();
-    await this.ebb.disableMotors();
-  }
-
-  public cancel(): void {
-    this._cancelRequested = true
-  }
-
-  public pause(): void {
-    this._unpaused = new Promise(resolve => {
-      this._signalUnpause = resolve
-    })
-    if (this.onpause) this.onpause(true)
-  }
-
-  public resume(): void {
-    const signal = this._signalUnpause
-    this._unpaused = null
-    this._signalUnpause = null
-    signal()
-  }
-
-  public async setPenHeight(height: number, rate: number): Promise<void> {
-    if (await this.ebb.supportsSR()) {
-      await this.ebb.setServoPowerTimeout(10000, true)
-    }
-    await this.ebb.setPenHeight(height, rate)
-  }
-
-  public limp(): void {
-    this.ebb.disableMotors()
-  }
-}
-
-class SaxiDriver implements Driver {
+class Driver {
   public static connect(): Driver {
-    const d = new SaxiDriver();
+    const d = new Driver();
     d.connect();
     return d;
   }
@@ -226,20 +101,8 @@ class SaxiDriver implements Driver {
   private connected: boolean;
   private pingInterval: number;
 
-  public name() {
-    return 'Saxi Server'
-  }
-
-  public close() {
-    this.socket.close()
-    return Promise.resolve()
-  }
-
   public connect() {
-
-    const websocketProtocol = document.location.protocol === "https:" ? "wss" : "ws";
-    this.socket = new WebSocket(`${websocketProtocol}://${document.location.host}/chat`);
-    
+    this.socket = new WebSocket(`ws://${document.location.host}/chat`);
     this.socket.addEventListener("open", () => {
       console.log(`Connected to EBB server.`);
       this.connected = true;
@@ -291,7 +154,7 @@ class SaxiDriver implements Driver {
         }
       }
     });
-    this.socket.addEventListener("error", () => {
+    this.socket.addEventListener("error", (_e: ErrorEvent) => {
       // TODO: something
     });
     this.socket.addEventListener("close", () => {
@@ -589,39 +452,6 @@ function PlanStatistics({plan}: {plan: Plan}) {
   return <div className="duration">
     <div>Duration</div>
     <div><strong>{plan && plan.duration ? formatDuration(plan.duration()) : "-"}</strong></div>
-  </div>;
-}
-
-function TimeLeft({plan, progress, currentMotionStartedTime, paused}: {
-  plan: Plan;
-  progress: number | null; 
-  currentMotionStartedTime: Date | null;
-  paused: boolean;
-}) {
-  const [_, setTime] = useState(new Date());
-
-  // Interval that ticks every second to rerender
-  // and recalculate time remaining for long motions
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setTime(new Date());
-    }, 1000);
-
-    return () => {
-      clearInterval(interval);
-    }
-  }, [setTime])
-
-  if (!plan || !plan.duration || progress === null || paused) {
-    return null;
-  }
-
-  const currentMotionTimeSpent = (new Date().getTime() - currentMotionStartedTime.getTime()) / 1000;
-  const duration = plan.duration(progress);
-
-  return <div className="duration">
-    <div className="time-remaining-label">Time remaining</div>
-    <div><strong>{formatDuration(duration - currentMotionTimeSpent)}</strong></div>
   </div>;
 }
 
@@ -1003,50 +833,7 @@ function PlanOptions({state}: {state: State}) {
   </div>;
 }
 
-function PortSelector({driver, setDriver}: {driver: Driver; setDriver: (d: Driver) => void}) {
-  const [initializing, setInitializing] = useState(false)
-  useEffect(() => {
-    (async () => {
-      try {
-        const ports = await navigator.serial.getPorts()
-        if (ports.length > 0) {
-          console.log('connecting to', ports[0])
-          // get the first
-          setDriver(await WebSerialDriver.connect(ports[0]))
-        }
-      } finally {
-        setInitializing(false)
-      }
-    })()
-  }, [])
-  return <>
-    {driver ? `Connected: ${driver.name()}` : null}
-    {!driver ?
-      <button
-        disabled={initializing}
-        onClick={async () => {
-          try {
-            const port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x04D8, usbProductId: 0xFD92 }] })
-            if (driver)
-              await driver.close()
-            setDriver(await WebSerialDriver.connect(port))
-          } catch (e) {
-            alert(`Failed to connect to serial device: ${e.message}`)
-            console.error(e)
-          }
-        }}
-      >
-        {/* TODO: allow changing port */}
-        {initializing ? "Connecting..." : (driver ? "Change Port" : "Connect")}
-      </button>
-      : null}
-  </>
-}
-
-function Root() {
-  const [driver, setDriver] = useState(
-    IS_WEB ? null as Driver | null : SaxiDriver.connect()
-  )
+function Root({driver}: {driver: Driver}) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [isPlanning, plan, setPlan] = usePlan(state.paths, state.planOptions);
   const [isLoadingFile, setIsLoadingFile] = useState(false);
@@ -1054,9 +841,7 @@ function Root() {
   useEffect(() => {
     window.localStorage.setItem("planOptions", JSON.stringify(state.planOptions));
   }, [state.planOptions]);
-
   useEffect(() => {
-    if (driver == null) return;
     driver.onprogress = (motionIdx: number) => {
       dispatch({type: "SET_PROGRESS", motionIdx});
     };
@@ -1075,9 +860,6 @@ function Root() {
     driver.onplan = (plan: Plan) => {
       setPlan(plan);
     };
-  }, [driver])
-
-  useEffect(() => {
     const ondrop = (e: DragEvent) => {
       e.preventDefault();
       const item = e.dataTransfer.items[0];
@@ -1120,11 +902,6 @@ function Root() {
     };
   });
 
-  // Each time new motion is started, save the start time
-  const currentMotionStartedTime = useMemo(() => {
-    return new Date();
-  }, [state.progress, plan, state.paused]);
-
   const previewArea = useRef(null);
   const previewSize = useComponentSize(previewArea);
   const showDragTarget = !plan && !isLoadingFile && !isPlanning;
@@ -1135,7 +912,6 @@ function Root() {
         <div className={`saxi-title red`} title={state.deviceInfo ? state.deviceInfo.path : null}>
           <span className="red reg">s</span><span className="teal">axi</span>
         </div>
-        {IS_WEB ? <PortSelector driver={driver} setDriver={setDriver} /> : null}
         {!state.connected ? <div className="info-disconnected">disconnected</div> : null}
         <div className="section-header">pen</div>
         <div className="section-body">
@@ -1160,12 +936,6 @@ function Root() {
           <div className="section-header">plot</div>
           <div className="section-body section-body__plot">
             <PlanStatistics plan={plan} />
-            <TimeLeft 
-              plan={plan} 
-              progress={state.progress} 
-              currentMotionStartedTime={currentMotionStartedTime}
-              paused={state.paused}
-            />
             <PlotButtons plan={plan} isPlanning={isPlanning} state={state} driver={driver} />
           </div>
         </div>
@@ -1191,7 +961,7 @@ function DragTarget() {
   </div>;
 }
 
-ReactDOM.render(<Root />, document.getElementById("app"));
+ReactDOM.render(<Root driver={Driver.connect()}/>, document.getElementById("app"));
 
 function withSVG<T>(svgString: string, fn: (svg: SVGSVGElement) => T): T {
   const div = document.createElement("div");
