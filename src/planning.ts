@@ -579,6 +579,6 @@ export function plan(
   });
   // finally, move back to (0, 0).
   motions.push(constantAccelerationPlan([curPos, {x: 0, y: 0}], profile.penUpProfile));
-  motions.push(new PenMotion(Device.Axidraw.penPctToPos(penMaxUpPos), profile.penUpPos, profile.penDropDuration));
+  // motions.push(new PenMotion(Device.Axidraw.penPctToPos(penMaxUpPos), profile.penUpPos, profile.penDropDuration));
   return new Plan(motions);
 }
